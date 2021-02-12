@@ -1,3 +1,8 @@
+use tokio::sync::oneshot;
+
+use crate::raftproto;
+use anyhow::Result;
+
 #[derive(Debug)]
 pub struct VoteRequest {
     pub term: u64,
@@ -10,4 +15,11 @@ pub struct VoteRequest {
 pub struct VoteResponse {
     pub term: u64,
     pub vote_granted: bool
+}
+
+pub enum RaftMsg {
+    RequestVote {
+        request: raftproto::RequestVoteRequest,
+        tx: oneshot::Sender<Result<raftproto::RequestVoteResponse>>
+    }
 }

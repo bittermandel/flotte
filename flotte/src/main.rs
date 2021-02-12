@@ -1,5 +1,9 @@
 mod raft;
 mod structs;
+mod server;
+
+use server::FlotteService;
+use tonic::transport::Server;
 
 pub mod raftproto {
     tonic::include_proto!("raft");
@@ -7,7 +11,9 @@ pub mod raftproto {
 
 #[tokio::main]
 async fn main() {
-    let mut peers = Vec::new();
-    peers.push("http://[::1]:5000");
-    raft::Raft::spawn(0, peers);
+    let server = FlotteService::new(0).await;
+    Server::builder()
+    .add_service(raftproto::request_vote_server::RequestVoteServer::new(server))
+    .serve("[::1]:8000".parse().unwrap())
+    .await.unwrap();
 }
