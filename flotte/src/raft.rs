@@ -1,58 +1,39 @@
+use std::{collections::HashSet, convert::TryFrom, time::Duration};
+
 use anyhow::Result;
 use mpsc::UnboundedReceiver;
-use tonic::Request;
-use std::{error::Error, time::{Duration, Instant}};
-use raftproto::{RequestVoteResponse, RequestVoteRequest};
+use rand::{Rng, thread_rng};
+use replication::Replication;
+use tonic::transport::Endpoint;
+use tracing::{Value, field::{Field, Visit}};
 
-use crate::{raftproto, structs::RaftMsg};
-use raftproto::request_vote_client::RequestVoteClient;
-use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use crate::{replication::{self, RaftEvent}, structs::RaftMsg};
+use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use tokio::time::sleep_until;
 
 pub struct Raft {
-    id: u64,
-    peers: Vec<&'static str>,
-    current_term: u64,
-    voted_for: Option<u64>,
-    target_state: State,
+    pub id: u64,
+    pub peers: HashSet<Peer>,
+    pub current_term: u64,
+    pub voted_for: Option<u64>,
+    pub target_state: State,
+    election_timeout: Option<Instant>,
     rx_api: mpsc::UnboundedReceiver<RaftMsg>,
 }
-impl Raft {
-    async fn handle_vote_request(&mut self, request: RequestVoteRequest) -> Result<RequestVoteResponse> {
-        if request.term < self.current_term {
-            return Ok(RequestVoteResponse{
-                term: self.current_term,
-                granted: false
-            });
-        }
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct Peer {
+    pub id: u64,
+    pub endpoint: String
+}
 
-        if request.term > self.current_term {
-            self.current_term = request.term;
-            self.voted_for = None;
-            self.target_state = State::Follower;
-        }
-
-        match self.voted_for {
-            Some(candidate_id) if candidate_id == request.candidate => Ok(RequestVoteResponse{
-                term: self.current_term,
-                granted: true
-            }),
-            Some(_) => Ok(RequestVoteResponse{
-                term: self.current_term,
-                granted: false
-            }),
-            None => {
-                self.voted_for = Some(request.candidate);
-                self.target_state = State::Follower;
-                Ok(RequestVoteResponse{
-                    term: self.current_term,
-                    granted: true
-                })
-            }
-        }
+impl From<Peer> for Endpoint {
+    fn from(p: Peer) -> Endpoint {
+        Endpoint::try_from(p.endpoint).unwrap()
     }
 }
+
 impl Raft {
-    pub fn spawn(id: u64, peers: Vec<&'static str>, rx_api: UnboundedReceiver<RaftMsg>) -> JoinHandle<Result<()>> {
+    pub fn spawn(id: u64, peers: HashSet<Peer>, rx_api: UnboundedReceiver<RaftMsg>) -> JoinHandle<Result<()>> {
         let this = Self {
             id,
             peers,
@@ -60,6 +41,7 @@ impl Raft {
             voted_for: None,
             current_term: 0,
             target_state: State::Follower,
+            election_timeout: None,
         };
         tokio::spawn(this.main())
     }
@@ -70,39 +52,33 @@ impl Raft {
             match &self.target_state {
                 State::Leader => LeaderState::new(&mut self).run().await?,
                 State::Follower => FollowerState::new(&mut self).run().await?,
+                State::Candidate => CandidateState::new(&mut self).run().await?,
             }
         }
     }
 
-    pub async fn request_vote(&self) -> Result<()> {
-        for &peer in &self.peers {
-            let request = tonic::Request::new(raftproto::RequestVoteRequest {
-                term: self.current_term,
-                candidate: self.id,
-                last_log_index: 0,
-                last_log_term: 0,
-            });
-            let mut client = RequestVoteClient::connect(peer).await;
-            match client {
-                Ok(mut client) => {
-                    let task = async move {
-                        match client.request_vote(request).await {
-                            Ok(_) => println!("All OK"),
-                            Err(err) => panic!(err),
-                        }
-                    };
-                    tokio::spawn(task);
-                }
-                Err(err) => println!("{}", err),
+    pub fn get_election_timeout(&mut self) -> Instant {
+        match self.election_timeout {
+            Some(inst) => inst,
+            None => {
+                let inst = Instant::now() + Duration::from_millis(thread_rng().gen_range(1500..3000));
+                self.election_timeout = Some(inst);
+                inst
             }
         }
-        return Ok(());
+    }
+
+    pub fn update_election_timeout(&mut self) {
+        let inst = Instant::now() + Duration::from_millis(thread_rng().gen_range(1500..3000));
+        self.election_timeout = Some(inst);
     }
 }
 
-enum State {
+#[derive(PartialEq)]
+pub enum State {
     Leader,
     Follower,
+    Candidate
 }
 
 impl State {
@@ -112,6 +88,10 @@ impl State {
 
     pub fn is_follower(&self) -> bool {
         matches!(self, Self::Follower)
+    }
+
+    pub fn is_candidate(&self) -> bool {
+        matches!(self, Self::Candidate)
     }
 }
 
@@ -124,16 +104,30 @@ impl<'a> LeaderState<'a> {
         return Self { raft };
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    #[tracing::instrument(level="info", skip(self), fields(id=self.raft.id, raft_state="leader"))]
+    pub async fn run(&mut self) -> Result<()> {
+        let mut repls: Vec<Replication> = vec![];
+        for peer in self.raft.peers.clone().into_iter() {
+            if peer.id == self.raft.id {
+                continue
+            }
+            repls.push(Replication::spawn(self.raft.id, Endpoint::from(peer), self.raft.current_term));
+        }
         loop {
             if !self.raft.target_state.is_leader() {
+                for repl in repls {
+                    let _ = repl.repltx.send(RaftEvent::Terminate);
+                }
                 return Ok(());
             }
-
+            
             tokio::select! {
                 Some(msg) = self.raft.rx_api.recv() => match msg {
                     RaftMsg::RequestVote{request, tx} => {
                         let _ = tx.send(self.raft.handle_vote_request(request).await);
+                    },
+                    RaftMsg::AppendEntries{request, tx} => {
+                        let _ = tx.send(self.raft.handle_append_entries_request(request).await);
                     }
                 }
             }
@@ -150,25 +144,84 @@ impl<'a> FollowerState<'a> {
         return Self { raft };
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    #[tracing::instrument(level="info", skip(self), fields(id=self.raft.id, raft_state="follower"))]
+    pub async fn run(&mut self) -> Result<()> {
         loop {
             if !self.raft.target_state.is_follower() {
                 return Ok(());
             }
 
+            let mut election_timeout = sleep_until(self.raft.get_election_timeout());
+            tokio::pin!(election_timeout);
+
             tokio::select! {
+                _ = &mut election_timeout => {
+                    tracing::info!("Transitioning into Candidate - election timer ran out");
+                    self.raft.target_state = State::Candidate;
+                }
                 Some(msg) = self.raft.rx_api.recv() => match msg {
                     RaftMsg::RequestVote{request, tx} => {
-                        let mut granted = false;
-                        if request.term > self.raft.current_term {
-                            self.raft.current_term = request.term;
-                            self.raft.voted_for = None;
+                        let _ = tx.send(self.raft.handle_vote_request(request).await);
+                    },
+                    RaftMsg::AppendEntries{request, tx} => {
+                        let _ = tx.send(self.raft.handle_append_entries_request(request).await);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct CandidateState<'a> {
+    pub raft: &'a mut Raft,
+    pub votes_granted: u64,
+    pub votes_needed: u64
+}
+
+impl<'a> CandidateState<'a> {
+    pub fn new(raft: &'a mut Raft) -> Self  {
+        Self { 
+            raft,
+            votes_granted: 0,
+            votes_needed: 0,
+        }
+    }
+
+    #[tracing::instrument(level="info", skip(self), fields(id=self.raft.id, raft_state="candidate"))]
+    pub async fn run(&mut self) -> Result<()> {
+        loop {
+            if !self.raft.target_state.is_candidate() {
+                return Ok(());
+            }
+
+            self.votes_granted = 1;
+            self.votes_needed = ((self.raft.peers.len() / 2) + 1) as u64;
+
+            self.raft.update_election_timeout();
+            self.raft.current_term += 1;
+            self.raft.voted_for = Some(self.raft.id);
+            self.raft.election_timeout = None;
+
+            let mut pending_votes = self.spawn_parallel_vote_requests().await;
+
+            let election_timeout = sleep_until(self.raft.get_election_timeout());
+            tokio::pin!(election_timeout);
+
+            loop {
+                if !self.raft.target_state.is_candidate() {
+                    return Ok(());
+                }
+
+                tokio::select! {
+                    _ = &mut election_timeout => break,
+                    Some (response) = pending_votes.recv() => self.handle_vote_response(response).await?,
+                    Some(msg) = self.raft.rx_api.recv() => match msg {
+                        RaftMsg::RequestVote{request, tx} => {
+                            let _ = tx.send(self.raft.handle_vote_request(request).await);
+                        },
+                        RaftMsg::AppendEntries{request, tx} => {
+                            let _ = tx.send(self.raft.handle_append_entries_request(request).await);
                         }
-                        if self.raft.voted_for.is_none() || self.raft.voted_for == Some(request.candidate) {
-                            self.raft.voted_for = Some(request.candidate);
-                            granted = true;
-                        }
-                        let _ = tx.send(Ok(raftproto::RequestVoteResponse{ term: self.raft.current_term, granted: granted}));
                     }
                 }
             }

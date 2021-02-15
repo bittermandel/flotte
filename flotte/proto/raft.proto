@@ -21,6 +21,29 @@ message RequestVoteResponse {
   bool granted = 2;
 }
 
-service RequestVote {
+message LogEntry {
+	uint64 Index=1;
+	uint64 Term=2;
+	string CommandName=3;
+	bytes Command=4; // for nop-command
+}
+  
+// RequestVoteResponse is the response returned from a RequestVoteRequest.
+message AppendEntriesRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  repeated LogEntry entries = 3;
+}
+
+message AppendEntriesResponse {
+	uint64 Term=1;
+	uint64 Index=2;
+ 	uint64 CommitIndex=3;
+	bool   Success=4;
+}
+
+
+service Raft {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
 }

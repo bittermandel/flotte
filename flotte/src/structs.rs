@@ -21,5 +21,9 @@ pub enum RaftMsg {
     RequestVote {
         request: raftproto::RequestVoteRequest,
         tx: oneshot::Sender<Result<raftproto::RequestVoteResponse>>
+    },
+    AppendEntries {
+        request: raftproto::AppendEntriesRequest,
+        tx: oneshot::Sender<Result<raftproto::AppendEntriesResponse>>
     }
 }
